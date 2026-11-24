@@ -133,7 +133,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let elapsed = Date().timeIntervalSince(startedAt)
         if elapsed >= Recorder.maxDuration { return stop() }
         let seconds = Int(elapsed)
-        setStatus(symbol: "stop.circle.fill", title: String(format: " %d:%02d", seconds / 60, seconds % 60))
+        setStatus("StatusRecordingTemplate", title: String(format: " %d:%02d", seconds / 60, seconds % 60))
     }
 
     private func stop() {
@@ -144,12 +144,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         timer = nil
         border?.orderOut(nil)
         border = nil
-        setStatus(symbol: "hourglass", title: "")
+        setStatus("hourglass", title: "")
         Task {
             do {
                 _ = try Output.deliver(try await recorder.stop())
                 phase = .idle
-                showIdle(symbol: "checkmark.circle")
+                showIdle(image: "checkmark.circle")
                 try? await Task.sleep(for: .seconds(1.5))
                 if phase == .idle { showIdle() }
             } catch {
@@ -162,13 +162,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     // MARK: Status item
 
-    private func showIdle(symbol: String = "record.circle") {
-        setStatus(symbol: symbol, title: "")
+    private func showIdle(image: String = "StatusTemplate") {
+        setStatus(image, title: "")
         statusItem.menu = menu
     }
 
-    private func setStatus(symbol: String, title: String) {
-        statusItem.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "gifshot")
+    /// `image` is a template image in the app bundle's Resources, or else an SF Symbol name.
+    private func setStatus(_ image: String, title: String) {
+        let icon = NSImage(named: image) ?? NSImage(systemSymbolName: image, accessibilityDescription: nil)
+        icon?.accessibilityDescription = "gifshot"
+        statusItem.button?.image = icon
         statusItem.button?.title = title
     }
 

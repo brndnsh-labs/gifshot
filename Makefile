@@ -20,6 +20,14 @@ app: build check-identity
 	rm -rf build/$(APP_NAME).app
 	mkdir -p "$(APP)/Contents/MacOS"
 	cp Resources/Info.plist "$(APP)/Contents/Info.plist"
+	mkdir -p "$(APP)/Contents/Resources"
+	cp Resources/Status*Template.svg "$(APP)/Contents/Resources/"
+	@# The partial plist flag is required: without it actool writes nothing and still exits 0.
+	xcrun actool Resources/AppIcon.icon --compile "$(APP)/Contents/Resources" \
+	  --platform macosx --minimum-deployment-target 27.0 --app-icon AppIcon \
+	  --output-partial-info-plist build/actool-partial.plist \
+	  --errors --warnings --output-format human-readable-text
+	test -f "$(APP)/Contents/Resources/Assets.car"
 	cp "$$(swift build -c $(CONFIG) --show-bin-path)/$(APP_NAME)" "$(APP)/Contents/MacOS/$(APP_NAME)"
 	codesign --force --options runtime --timestamp=none --sign "$(SIGN_IDENTITY)" "$(APP)"
 

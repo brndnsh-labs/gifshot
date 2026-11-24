@@ -20,6 +20,7 @@ Status: planning complete, ready for implementation.
 | Encoding | ImageIO (`CGImageDestination`, GIF), encoded in batches of 10 frames whose blocks are spliced into one file as recording proceeds | Built in, no ffmpeg. ImageIO holds every frame until finalize and then needs ~2x their raw size at once (~7 GB for 60 s of full screen), so one destination per recording isn't viable. Quantization is mediocre; revisit (e.g. gifski) only if it's a real problem. |
 | Dependencies | None | Maintainability |
 | Distribution | Personal only for v1 | Signed with a local stable identity via `SIGN_IDENTITY`. Notarization would be a future `make release` target, not a rewrite. |
+| Icons | "Viewfinder": region corners around a red record dot, on indigo (#26215C). App icon is an Icon Composer `Resources/AppIcon.icon` (SVG layers, dark and tinted overrides) compiled by `xcrun actool` in the Makefile. Menu bar uses `StatusTemplate.svg` / `StatusRecordingTemplate.svg` (dot becomes a stop square) | Distinct from Shottr/Kap/QuickTime, legible at 18 pt. `.icon` gives the native macOS 27 look; a plain `.icns` gets shrunk onto a gray tile. `.icon`'s JSON is undocumented: edit it in Icon Composer and commit the result. |
 | Name / bundle ID | `gifshot` / `zip.brndn.gifshot` | Bundle ID is permanent: TCC permissions are keyed to it. Don't change it. |
 
 ## v1 scope
@@ -56,6 +57,8 @@ gifshot/
   Makefile              # build, bundle, sign, run, clean
   Resources/
     Info.plist          # LSUIElement, zip.brndn.gifshot, min OS 27
+    AppIcon.icon/       # app icon (Icon Composer)
+    Status*Template.svg # menu bar glyphs, idle and recording
   Sources/gifshot/
     App.swift           # NSApplication setup, status item, menu
     Hotkey.swift        # Carbon hotkey registration
