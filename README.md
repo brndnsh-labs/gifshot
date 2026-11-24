@@ -45,3 +45,7 @@ make run
 | `make clean` | Remove `.build/` and `build/` |
 
 The first recording asks for Screen Recording permission. After you allow it in System Settings, quit gifshot and run it again. The first save may also ask for access to the Desktop folder.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
