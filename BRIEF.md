@@ -32,7 +32,7 @@ Status: planning complete, ready for implementation.
 2. **Recording indicator:** menu bar icon changes state and shows elapsed time (e.g. `0:12`) while recording; thin border around the captured region (excluded from capture).
 3. **Length cap:** recording auto-stops at 60 seconds and saves what was captured, same as a manual stop.
 4. **Output:** GIF written to `~/Desktop/gifshot-<timestamp>.gif` and copied to the clipboard (file URL plus GIF data, so it pastes into Slack/Finder/etc.).
-5. **Defaults:** 15 fps, loop forever. Max width (downscale only, preserve aspect): 800 px for regions, 1280 px for full screen. Full screen gets the larger cap so text stays readable; full-screen GIFs will still be large, which is inherent to the format.
+5. **Defaults:** 30 fps, but frames that change more than a quarter of the picture (scrolling, video, dragged windows) are limited to 15 fps, loop forever. Max width (downscale only, preserve aspect): 800 px for regions, 1280 px for full screen. Full screen gets the larger cap so text stays readable; full-screen GIFs will still be large, which is inherent to the format. Large changes cost nearly a whole frame of bytes each, so limiting them keeps scrolling and video at 15 fps size while the cursor, typing and small UI changes animate at 30.
 6. **Menu:** Record Full Screen, Record Region, Open last GIF, Reveal output folder, Quit.
 
 ## Out of scope for v1
@@ -44,7 +44,7 @@ Editor/trimming, settings window, MP4 export, audio, window capture mode, cloud 
 - **Hotkeys:** Carbon `RegisterEventHotKey` (two registrations). Still works, needs no Accessibility permission, no dependency.
 - **Full screen:** `SCContentFilter` for the `SCDisplay` containing the mouse location; exclude gifshot's own windows.
 - **Region selection:** one borderless, transparent `NSWindow` per screen at `.screenSaver` level; crosshair cursor; Esc cancels. Convert the selection to the display's coordinate space for `SCStreamConfiguration.sourceRect`, accounting for backing scale factor.
-- **Frames:** `SCStreamOutput` delivers `CMSampleBuffer`s. Convert to `CGImage` (`SCStreamConfiguration` width/height does the downscale) and encode as frames arrive (don't buffer the whole recording in memory). `GIFWriter` encodes each batch with its own palette, converted to per-frame local color tables. Each batch re-encodes the previous batch's last frame and drops it, so frames stay small transparent diffs across batch boundaries. Use real timestamps for per-frame delay so dropped frames don't speed up playback. A frame that would get under 2 cs (the GIF minimum viewers honor) is replaced by the next one, so capture rates above 50 fps don't play slow.
+- **Frames:** `SCStreamOutput` delivers `CMSampleBuffer`s. Convert to `CGImage` (`SCStreamConfiguration` width/height does the downscale) and encode as frames arrive (don't buffer the whole recording in memory). `GIFWriter` encodes each batch with its own palette, converted to per-frame local color tables. Each batch re-encodes the previous batch's last frame and drops it, so frames stay small transparent diffs across batch boundaries. `FrameThrottle` sits between the stream and the writer: it skips byte-identical frames and holds back a large-change frame that arrives under 1/15 s after the last one written, writing it on a timer if no newer frame replaces it. `queueDepth` is 6 to absorb ImageIO's batch flushes, which can block for up to ~200 ms at 1280 px. Use real timestamps for per-frame delay so dropped frames don't speed up playback. A frame that would get under 2 cs (the GIF minimum viewers honor) is replaced by the next one, so capture rates above 50 fps don't play slow.
 - **Permissions:** Screen Recording via TCC. Handle the not-yet-granted case with a clear message and a button that opens the right System Settings pane.
 - **Signing gotcha:** TCC ties the Screen Recording grant to the code signature. Ad-hoc signing (`codesign -s -`) produces a new identity each build, which can make macOS forget the permission on every rebuild. Sign with a stable identity (a local self-signed cert or an Apple Development cert) via a `SIGN_IDENTITY` variable in the Makefile.
 
@@ -63,6 +63,7 @@ gifshot/
     App.swift           # NSApplication setup, status item, menu
     Hotkey.swift        # Carbon hotkey registration
     RegionPicker.swift  # overlay windows, selection
+    FrameThrottle.swift # skips unchanged frames, limits large changes to 15 fps
     Recorder.swift      # SCStream setup and frame delivery
     GIFWriter.swift     # ImageIO incremental GIF encoding
     Output.swift        # file naming, clipboard, reveal

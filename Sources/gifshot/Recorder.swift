@@ -14,7 +14,9 @@ enum RecorderError: LocalizedError {
 
 /// One recording: an `SCStream` of a display (optionally cropped to a region) feeding a `GIFWriter`.
 final class Recorder {
-    static let fps = 15
+    static let fps = 30
+    /// Rate for frames that change most of the picture; see `FrameThrottle`.
+    static let fullMotionFPS = 15
     static let maxDuration: TimeInterval = 60
 
     private let stream: SCStream
@@ -57,13 +59,15 @@ final class Recorder {
         config.width = max(2, Int((pixelWidth * scale).rounded()))
         config.height = max(2, Int((source.height * screen.backingScaleFactor * scale).rounded()))
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
+        config.queueDepth = 6  // room for ImageIO's batch flushes, which can block for ~200 ms
         config.pixelFormat = kCVPixelFormatType_32BGRA
         config.colorSpaceName = CGColorSpace.sRGB
         config.showsCursor = true
 
         let url = Output.temporaryURL()
         let writer = try GIFWriter(url: url, maxFrames: Int(maxDuration + 5) * fps)
-        let sink = FrameSink(writer: writer) { error in
+        let throttle = FrameThrottle(writer: writer, fullMotionFPS: fullMotionFPS)
+        let sink = FrameSink(throttle: throttle) { error in
             Task { @MainActor in onFailure(error) }
         }
         let stream = SCStream(filter: filter, configuration: config, delegate: sink)
@@ -84,15 +88,15 @@ final class Recorder {
     }
 }
 
-/// Receives frames on its own serial queue and hands them to the writer. All writer access
-/// happens on `queue`.
+/// Receives frames on its own serial queue and hands them to the throttle. All throttle and writer
+/// access happens on `queue`.
 private nonisolated final class FrameSink: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     let queue = DispatchQueue(label: "zip.brndn.gifshot.frames", qos: .userInitiated)
-    private let writer: GIFWriter
+    private let throttle: FrameThrottle
     private let onError: @Sendable (Error) -> Void
 
-    init(writer: GIFWriter, onError: @escaping @Sendable (Error) -> Void) {
-        self.writer = writer
+    init(throttle: FrameThrottle, onError: @escaping @Sendable (Error) -> Void) {
+        self.throttle = throttle
         self.onError = onError
     }
 
@@ -102,9 +106,18 @@ private nonisolated final class FrameSink: NSObject, SCStreamOutput, SCStreamDel
               let info = (CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
                   as? [[SCStreamFrameInfo: Any]])?.first,
               let rawStatus = info[.status] as? Int, SCFrameStatus(rawValue: rawStatus) == .complete,
-              let pixels = sampleBuffer.imageBuffer,
-              let image = Self.copyImage(pixels) else { return }
-        writer.add(image, at: sampleBuffer.presentationTimeStamp.seconds)
+              let pixels = sampleBuffer.imageBuffer else { return }
+        CVPixelBufferLockBaseAddress(pixels, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixels, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pixels) else { return }
+        let flushAt = throttle.add(base, bytesPerRow: CVPixelBufferGetBytesPerRow(pixels),
+                                   width: CVPixelBufferGetWidth(pixels), height: CVPixelBufferGetHeight(pixels),
+                                   at: sampleBuffer.presentationTimeStamp.seconds)
+        if let flushAt {
+            queue.asyncAfter(deadline: .now() + max(0, flushAt - Self.now())) {
+                self.throttle.flushHeld(at: Self.now())
+            }
+        }
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
@@ -113,23 +126,10 @@ private nonisolated final class FrameSink: NSObject, SCStreamOutput, SCStreamDel
 
     func finish(at time: Double) async -> Bool {
         await withCheckedContinuation { continuation in
-            queue.async { continuation.resume(returning: self.writer.finish(at: time)) }
+            queue.async { continuation.resume(returning: self.throttle.finish(at: time)) }
         }
     }
 
-    /// Copies the pixels out so ScreenCaptureKit can reuse its buffer while frames wait to be encoded.
-    private static func copyImage(_ buffer: CVPixelBuffer) -> CGImage? {
-        CVPixelBufferLockBaseAddress(buffer, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
-        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return nil }
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
-        let height = CVPixelBufferGetHeight(buffer)
-        guard let provider = CGDataProvider(data: Data(bytes: base, count: bytesPerRow * height) as CFData),
-              let space = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
-        return CGImage(width: CVPixelBufferGetWidth(buffer), height: height, bitsPerComponent: 8,
-                       bitsPerPixel: 32, bytesPerRow: bytesPerRow, space: space,
-                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue
-                           | CGBitmapInfo.byteOrder32Little.rawValue),
-                       provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
-    }
+    /// Host clock seconds, the clock ScreenCaptureKit timestamps frames with.
+    private static func now() -> Double { CMClockGetTime(CMClockGetHostTimeClock()).seconds }
 }
