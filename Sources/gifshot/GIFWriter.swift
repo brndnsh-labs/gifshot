@@ -1,48 +1,98 @@
 import Foundation
-import ImageIO
-import UniformTypeIdentifiers
 
-/// Streams an animated GIF to disk as frames arrive.
+/// Streams an animated GIF to disk as frames arrive, in constant memory.
 ///
-/// ImageIO's GIF encoder holds every frame until `CGImageDestinationFinalize`, then needs ~2x the raw
-/// pixel size of all of them at once (gigabytes for a 60 s recording). So frames are encoded with
-/// ImageIO in small batches and each batch's image blocks are spliced into one file. Every batch
-/// starts by re-encoding the previous batch's last frame, which is then dropped, so the batch's first
-/// real frame is still stored as a small diff (ImageIO crops unchanged pixels to transparency).
+/// Each frame is stored as a diff: only the rectangle that changed, with pixels that are still
+/// within `tolerance` of what's on screen left transparent. Colors come from `Palette`. A frame is
+/// written once the next frame's timestamp gives it a delay, so dropped or skipped frames don't
+/// speed up playback. (ImageIO isn't used: its GIF encoder holds every frame until finalize.)
 ///
 /// Not thread-safe: use from one serial queue.
 nonisolated final class GIFWriter {
-    static let batchSize = 10
+    /// A changed pixel within this distance per channel of what's already shown is left alone. It
+    /// hides capture noise and video grain, which would otherwise make nearly every pixel change.
+    static let tolerance = 4
 
+    let width: Int, height: Int
     private let file: FileHandle
     private let maxFrames: Int
-    private var pending: (image: CGImage, time: Double)?  // waiting for the next timestamp
-    private var batch: [(image: CGImage, centiseconds: Int)] = []
-    private var carry: CGImage?  // last frame already written, used as the next batch's reference
+    private let previous: UnsafeMutablePointer<UInt32>  // last source frame added
+    private let shown: UnsafeMutablePointer<UInt32>     // what a viewer displays (RGB only)
+    private let indices: UnsafeMutablePointer<UInt8>
+    private let palette = Palette()
+    private let lzw = LZW()
+    private var pending: (block: [UInt8], transparentIndex: Int?, time: Double)?
     private var origin: Double?
     private var elapsedCentiseconds = 0
-    private var wroteHeader = false
     private var finished = false
     private(set) var frameCount = 0
 
-    init(url: URL, maxFrames: Int) throws {
+    init(url: URL, width: Int, height: Int, maxFrames: Int) throws {
+        precondition((1 ..< 65536).contains(width) && (1 ..< 65536).contains(height))
+        self.width = width
+        self.height = height
+        self.maxFrames = maxFrames
         FileManager.default.createFile(atPath: url.path, contents: nil)
         file = try FileHandle(forWritingTo: url)
-        self.maxFrames = maxFrames
+        previous = .allocate(capacity: width * height)
+        shown = .allocate(capacity: width * height)
+        indices = .allocate(capacity: width * height)
+        var header = Array("GIF89a".utf8) + Self.le16(width) + Self.le16(height)
+        header += [0x70, 0, 0]  // no global color table
+        header += [0x21, 0xFF, 0x0B] + Array("NETSCAPE2.0".utf8) + [0x03, 0x01, 0x00, 0x00, 0x00]  // loop forever
+        file.write(Data(header))
     }
 
-    /// Adds a frame captured at `time` (seconds, any monotonic clock). A frame's delay is the time
-    /// until the next one, so dropped or skipped frames don't speed up playback. A frame that would
-    /// be shown for under 2 cs is replaced by the next one instead: viewers treat such short delays
-    /// as 10 cs, and clamping them up to 2 cs would make captures above 50 fps play slow.
-    func add(_ image: CGImage, at time: Double) {
-        guard !finished, frameCount + batch.count < maxFrames else { return }
-        if origin == nil { origin = time }
-        if let pending {
-            if delay(until: time) < 2 { return self.pending = (image, pending.time) }
-            enqueue(pending.image, until: time)
+    deinit {
+        previous.deallocate()
+        shown.deallocate()
+        indices.deallocate()
+    }
+
+    /// Adds a BGRA frame of `width` × `height` captured at `time` (seconds, any monotonic clock).
+    /// Its delay is the time until the next frame. Frames should be at least 2 cs apart; a shorter
+    /// delay is clamped, since viewers treat anything under 2 cs as 10 cs.
+    func add(_ base: UnsafeRawPointer, bytesPerRow: Int, at time: Double) {
+        guard !finished, frameCount < maxFrames else { return }
+        let src = Pixels(base: base, bytesPerRow: bytesPerRow)
+        let first = frameCount == 0
+        guard let changed = first ? Box(left: 0, top: 0, right: width - 1, bottom: height - 1)
+            : changedBox(src) else { return }
+
+        // Mark the pixels that need updating, and shrink the box to them.
+        var box = Box(left: width, top: height, right: -1, bottom: -1)
+        for y in changed.top ... changed.bottom {
+            let s = src.row(y), p = previous + y * width, v = shown + y * width, m = indices + y * width
+            for x in changed.left ... changed.right {
+                let c = s[x]
+                let update = first || (c != p[x] && !Self.close(c, v[x]))
+                p[x] = c
+                m[x] = update ? 1 : 0
+                if update {
+                    box.left = min(box.left, x); box.right = max(box.right, x)
+                    box.top = min(box.top, y); box.bottom = y
+                }
+            }
         }
-        pending = (image, time)
+        guard box.right >= 0 else { return }  // every change is within tolerance of what's shown
+
+        let (colors, transparent) = palette.map(src, box, indices: indices, shown: shown, stride: width)
+        let entries = colors.count + (transparent ? 1 : 0)
+        var bits = 1
+        while 1 << bits < entries { bits += 1 }
+
+        var block: [UInt8] = [0x2C] + Self.le16(box.left) + Self.le16(box.top)
+        block += Self.le16(box.width) + Self.le16(box.height) + [0x80 | UInt8(bits - 1)]  // local color table
+        block.reserveCapacity(block.count + 3 << bits + box.width * box.height / 2)
+        for i in 0 ..< 1 << bits {
+            let c = i < colors.count ? colors[i] : 0
+            block += [UInt8((c >> 16) & 0xFF), UInt8((c >> 8) & 0xFF), UInt8(c & 0xFF)]
+        }
+        lzw.encode(indices, stride: width, box, minimumCodeSize: max(2, bits), into: &block)
+
+        writePending(until: time)
+        pending = (block, transparent ? colors.count : nil, time)
+        frameCount += 1
     }
 
     /// Writes the last frame (shown until `time`) and closes the file. Returns false if no frames
@@ -52,100 +102,123 @@ nonisolated final class GIFWriter {
         finished = true
         if let pending {
             let shown = time - pending.time
-            enqueue(pending.image, until: pending.time + (shown > 0 && shown < 120 ? shown : 1.0 / 15))
+            writePending(until: pending.time + (shown > 0 && shown < 120 ? shown : 1.0 / 15))
         }
-        flush()
-        if wroteHeader { file.write(Data([0x3B])) }  // trailer
+        file.write(Data([0x3B]))  // trailer
         try? file.close()
-        return wroteHeader
+        return frameCount > 0
     }
 
-    /// Centiseconds from the end of the last enqueued frame to `end`. Rounding the running total
-    /// means per-frame rounding error never accumulates.
-    private func delay(until end: Double) -> Int {
-        Int(((end - origin!) * 100).rounded()) - elapsedCentiseconds
+    /// Bounding box of the pixels that differ from the previous frame, or nil if none do.
+    private func changedBox(_ src: Pixels) -> Box? {
+        var box = Box(left: width, top: -1, right: -1, bottom: -1)
+        for y in 0 ..< height {
+            let s = src.row(y), p = previous + y * width
+            guard memcmp(s, p, width * 4) != 0 else { continue }
+            if box.top < 0 { box.top = y }
+            box.bottom = y
+            // Only the columns outside the box found so far need scanning.
+            var x = 0
+            while x < box.left, s[x] == p[x] { x += 1 }
+            box.left = min(box.left, x)
+            x = width - 1
+            while x > box.right, s[x] == p[x] { x -= 1 }
+            box.right = max(box.right, x)
+        }
+        return box.top < 0 ? nil : box
     }
 
-    private func enqueue(_ image: CGImage, until end: Double) {
-        let delay = max(2, delay(until: end))  // only the final frame can still be this short
+    @inline(__always) private static func close(_ a: UInt32, _ b: UInt32) -> Bool {
+        abs(Int((a >> 16) & 0xFF) - Int((b >> 16) & 0xFF)) <= tolerance
+            && abs(Int((a >> 8) & 0xFF) - Int((b >> 8) & 0xFF)) <= tolerance
+            && abs(Int(a & 0xFF) - Int(b & 0xFF)) <= tolerance
+    }
+
+    private func writePending(until end: Double) {
+        guard let pending else { return }
+        let origin = self.origin ?? pending.time
+        self.origin = origin
+        // Round on the running total so per-frame rounding error never accumulates.
+        let delay = max(2, Int(((end - origin) * 100).rounded()) - elapsedCentiseconds)
         elapsedCentiseconds += delay
-        batch.append((image, delay))
-        if batch.count == Self.batchSize { flush() }
+        let flags: UInt8 = 0x04 | (pending.transparentIndex == nil ? 0 : 1)  // leave in place; transparency
+        var bytes: [UInt8] = [0x21, 0xF9, 0x04, flags, UInt8(delay & 0xFF), UInt8(delay >> 8),
+                              UInt8(pending.transparentIndex ?? 0), 0]
+        bytes += pending.block
+        file.write(Data(bytes))
+        self.pending = nil
     }
 
-    private func flush() {
-        guard let last = batch.last?.image else { return }
-        let images = (carry.map { [$0] } ?? []) + batch.map(\.image)
-        let data = NSMutableData()
-        guard let destination = CGImageDestinationCreateWithData(data, UTType.gif.identifier as CFString,
-                                                                 images.count, nil) else { return }
-        for image in images { CGImageDestinationAddImage(destination, image, nil) }
-        if CGImageDestinationFinalize(destination) {
-            splice(Array(data as Data), skipFirst: carry != nil, delays: batch.map(\.centiseconds))
-            frameCount += batch.count
-            carry = last
-        } else {
-            NSLog("gifshot: failed to encode \(batch.count) frames")
-        }
-        batch.removeAll()
-    }
+    private static func le16(_ v: Int) -> [UInt8] { [UInt8(v & 0xFF), UInt8(v >> 8)] }
+}
 
-    /// Copies a batch GIF's frames into the output file. The batch's global color table becomes a
-    /// local table on each frame, since every batch has its own palette.
-    private func splice(_ gif: [UInt8], skipFirst: Bool, delays: [Int]) {
-        guard gif.count > 13 else { return }
-        let screenFlags = gif[10]
-        let globalTableSize = screenFlags & 0x80 != 0 ? 3 << (Int(screenFlags & 0x07) + 1) : 0
-        let globalTable = gif[13 ..< 13 + globalTableSize]
-        if !wroteHeader {
-            var header = Array("GIF89a".utf8) + gif[6 ..< 10]  // canvas width, height
-            header += [0x70, 0, 0]  // no global color table
-            header += [0x21, 0xFF, 0x0B] + Array("NETSCAPE2.0".utf8) + [0x03, 0x01, 0x00, 0x00, 0x00]  // loop forever
-            file.write(Data(header))
-            wroteHeader = true
-        }
+/// GIF's variable-width LZW, with a directly indexed dictionary (`child[prefix << 8 | index]`).
+private nonisolated final class LZW {
+    private let child = UnsafeMutablePointer<UInt16>.allocate(capacity: 4096 * 256)  // 0 = no entry
+    private var used: [Int] = []
+    private var codes: [UInt8] = []
 
-        var out: [UInt8] = []
-        var control: [UInt8]?
-        var index = skipFirst ? -1 : 0  // frame index into `delays`; -1 is the dropped reference frame
-        var p = 13 + globalTableSize
-        while p < gif.count {
-            switch gif[p] {
-            case 0x21:  // extension; keep only graphic control, which belongs to the next image
-                let end = Self.endOfSubBlocks(gif, from: p + 2)
-                if gif[p + 1] == 0xF9 { control = Array(gif[p ..< end]) }
-                p = end
-            case 0x2C:  // image descriptor, optional local color table, LZW data
-                var descriptor = Array(gif[p ..< p + 10])
-                var q = p + 10
-                var table = globalTable
-                if descriptor[9] & 0x80 != 0 {
-                    let size = 3 << (Int(descriptor[9] & 0x07) + 1)
-                    table = gif[q ..< q + size]
-                    q += size
-                } else {
-                    descriptor[9] = (descriptor[9] & 0x78) | 0x80 | (screenFlags & 0x07)
-                }
-                let end = Self.endOfSubBlocks(gif, from: q + 1)
-                if index >= 0, index < delays.count {
-                    var gce = control ?? [0x21, 0xF9, 0x04, 0x04, 0, 0, 0, 0]  // leave in place, no transparency
-                    gce[4] = UInt8(delays[index] & 0xFF)
-                    gce[5] = UInt8(delays[index] >> 8)
-                    out += gce + descriptor + table + gif[q ..< end]
-                }
-                index += 1
-                control = nil
-                p = end
-            default:  // trailer
-                p = gif.count
+    init() { child.initialize(repeating: 0, count: 4096 * 256) }
+    deinit { child.deallocate() }
+
+    /// Appends the image data (minimum code size byte, then sub-blocks) for `box` of `indices`.
+    func encode(_ indices: UnsafePointer<UInt8>, stride: Int, _ box: Box, minimumCodeSize: Int,
+                into block: inout [UInt8]) {
+        let clear = 1 << minimumCodeSize, end = clear + 1
+        var next = end + 1, size = minimumCodeSize + 1
+        var buffer: UInt64 = 0, count = 0
+        codes.removeAll(keepingCapacity: true)
+        func put(_ code: Int) {
+            buffer |= UInt64(code) << UInt64(count)
+            count += size
+            while count >= 8 {
+                codes.append(UInt8(truncatingIfNeeded: buffer))
+                buffer >>= 8
+                count -= 8
             }
         }
-        file.write(Data(out))
-    }
+        func reset() {
+            for slot in used { child[slot] = 0 }
+            used.removeAll(keepingCapacity: true)
+        }
 
-    private static func endOfSubBlocks(_ bytes: [UInt8], from start: Int) -> Int {
-        var p = start
-        while p < bytes.count, bytes[p] != 0 { p += Int(bytes[p]) + 1 }
-        return min(p + 1, bytes.count)
+        put(clear)
+        var prefix = -1
+        for y in box.top ... box.bottom {
+            let row = indices + y * stride
+            for x in box.left ... box.right {
+                let k = Int(row[x])
+                if prefix < 0 { prefix = k; continue }
+                let slot = prefix << 8 | k
+                if child[slot] != 0 { prefix = Int(child[slot]); continue }
+                put(prefix)
+                if next < 4096 {
+                    child[slot] = UInt16(next)
+                    used.append(slot)
+                    if next == 1 << size && size < 12 { size += 1 }
+                    next += 1
+                } else {  // table full: start over
+                    put(clear)
+                    reset()
+                    next = end + 1
+                    size = minimumCodeSize + 1
+                }
+                prefix = k
+            }
+        }
+        put(prefix)
+        put(end)
+        if count > 0 { codes.append(UInt8(truncatingIfNeeded: buffer)) }
+        reset()
+
+        block.append(UInt8(minimumCodeSize))
+        var p = 0
+        while p < codes.count {
+            let n = min(255, codes.count - p)
+            block.append(UInt8(n))
+            block += codes[p ..< p + n]
+            p += n
+        }
+        block.append(0)
     }
 }

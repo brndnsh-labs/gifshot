@@ -59,13 +59,13 @@ final class Recorder {
         config.width = max(2, Int((pixelWidth * scale).rounded()))
         config.height = max(2, Int((source.height * screen.backingScaleFactor * scale).rounded()))
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
-        config.queueDepth = 6  // room for ImageIO's batch flushes, which can block for ~200 ms
         config.pixelFormat = kCVPixelFormatType_32BGRA
         config.colorSpaceName = CGColorSpace.sRGB
         config.showsCursor = true
 
         let url = Output.temporaryURL()
-        let writer = try GIFWriter(url: url, maxFrames: Int(maxDuration + 5) * fps)
+        let writer = try GIFWriter(url: url, width: config.width, height: config.height,
+                                   maxFrames: Int(maxDuration + 5) * fps)
         let throttle = FrameThrottle(writer: writer, fullMotionFPS: fullMotionFPS)
         let sink = FrameSink(throttle: throttle) { error in
             Task { @MainActor in onFailure(error) }
