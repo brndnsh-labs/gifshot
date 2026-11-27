@@ -32,10 +32,16 @@ nonisolated final class GIFWriter {
     }
 
     /// Adds a frame captured at `time` (seconds, any monotonic clock). A frame's delay is the time
-    /// until the next one, so dropped or skipped frames don't speed up playback.
+    /// until the next one, so dropped or skipped frames don't speed up playback. A frame that would
+    /// be shown for under 2 cs is replaced by the next one instead: viewers treat such short delays
+    /// as 10 cs, and clamping them up to 2 cs would make captures above 50 fps play slow.
     func add(_ image: CGImage, at time: Double) {
         guard !finished, frameCount + batch.count < maxFrames else { return }
-        if let pending { enqueue(pending.image, from: pending.time, to: time) }
+        if origin == nil { origin = time }
+        if let pending {
+            if delay(until: time) < 2 { return self.pending = (image, pending.time) }
+            enqueue(pending.image, until: time)
+        }
         pending = (image, time)
     }
 
@@ -46,7 +52,7 @@ nonisolated final class GIFWriter {
         finished = true
         if let pending {
             let shown = time - pending.time
-            enqueue(pending.image, from: pending.time, to: pending.time + (shown > 0 && shown < 120 ? shown : 1.0 / 15))
+            enqueue(pending.image, until: pending.time + (shown > 0 && shown < 120 ? shown : 1.0 / 15))
         }
         flush()
         if wroteHeader { file.write(Data([0x3B])) }  // trailer
@@ -54,12 +60,14 @@ nonisolated final class GIFWriter {
         return wroteHeader
     }
 
-    private func enqueue(_ image: CGImage, from start: Double, to end: Double) {
-        // Round on the running total so per-frame rounding error never accumulates.
-        let origin = self.origin ?? start
-        self.origin = origin
-        let endCentiseconds = Int(((end - origin) * 100).rounded())
-        let delay = max(2, endCentiseconds - elapsedCentiseconds)  // < 2 cs gets clamped by viewers
+    /// Centiseconds from the end of the last enqueued frame to `end`. Rounding the running total
+    /// means per-frame rounding error never accumulates.
+    private func delay(until end: Double) -> Int {
+        Int(((end - origin!) * 100).rounded()) - elapsedCentiseconds
+    }
+
+    private func enqueue(_ image: CGImage, until end: Double) {
+        let delay = max(2, delay(until: end))  // only the final frame can still be this short
         elapsedCentiseconds += delay
         batch.append((image, delay))
         if batch.count == Self.batchSize { flush() }

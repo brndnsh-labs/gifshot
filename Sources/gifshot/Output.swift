@@ -24,16 +24,19 @@ enum Output {
         return destination
     }
 
-    /// File URL (Finder, Slack upload) plus the GIF bytes (apps that paste images).
-    static func copyToClipboard(_ url: URL) {
+    /// File URL (Finder, Slack upload) plus the GIF bytes (apps that paste images). The bytes are
+    /// read from disk only when an app asks for them, so a large GIF isn't held in memory.
+    static func copyToClipboard(_ url: URL, pasteboard: NSPasteboard = .general) {
         let item = NSPasteboardItem()
         item.setString(url.absoluteString, forType: .fileURL)
-        if let data = try? Data(contentsOf: url) {
-            item.setData(data, forType: NSPasteboard.PasteboardType(UTType.gif.identifier))
-        }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.writeObjects([item])
+        let provider = FileDataProvider(url: url)
+        item.setDataProvider(provider, forTypes: [NSPasteboard.PasteboardType(UTType.gif.identifier)])
+        clipboardProvider = provider  // kept alive while it's on the clipboard
+        pasteboard.clearContents()
+        pasteboard.writeObjects([item])
     }
+
+    private static var clipboardProvider: FileDataProvider?
 
     static var lastGIF: URL? {
         get {
@@ -54,5 +57,15 @@ enum Output {
         } else {
             NSWorkspace.shared.open(folder)
         }
+    }
+}
+
+private nonisolated final class FileDataProvider: NSObject, NSPasteboardItemDataProvider {
+    let url: URL
+    init(url: URL) { self.url = url }
+
+    func pasteboard(_ pasteboard: NSPasteboard?, item: NSPasteboardItem,
+                    provideDataForType type: NSPasteboard.PasteboardType) {
+        if let data = try? Data(contentsOf: url) { item.setData(data, forType: type) }
     }
 }
